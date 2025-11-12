@@ -1,7 +1,9 @@
+// ──────────────────────────────────────────────────────────────────────
 // app/(tabs)/history.tsx
+// ──────────────────────────────────────────────────────────────────────
 import React, { useEffect, useState } from 'react';
-import { View, StyleSheet, SectionList, Linking } from 'react-native';
-import { Text, Button, Divider } from 'react-native-paper';
+import { View, StyleSheet, SectionList, Animated, TouchableOpacity } from 'react-native';
+import { Text, Button, Divider, IconButton } from 'react-native-paper';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Sharing from 'expo-sharing';
 
@@ -10,58 +12,121 @@ type Order = {
   clientName: string;
   mobile: string;
   address: string;
-  dateTime: string;
-  mealType: string;
-  noOfGuests: string;
-  menuItems: { name: string; qty: string; cost: string }[];
-  notes: string;
-  totalCost: string;
+  dateTime: string; // "12/11/2025 at 3:30 PM"
+  orderBlocks: { description: string; notes: string }[];
+  quotationAmount: string;
   pdfUri: string;
 };
 
-export default function HistoryScreen() {
-  const [sections, setSections] = useState<{ title: string; data: Order[] }[]>([]);
+type Section = {
+  title: string;
+  data: Order[];
+  count: number;
+};
 
-  const parseDate = (s: string): Date => {
-    const [datePart, timePart] = s.split(' at ');
-    const [d, m, y] = datePart.split('/').map(Number);
-    const [t, ampm] = timePart.split(' ');
-    let [h, min] = t.split(':').map(Number);
-    if (ampm.toLowerCase() === 'pm' && h !== 12) h += 12;
-    if (ampm.toLowerCase() === 'am' && h === 12) h = 0;
-    return new Date(y, m - 1, d, h, min);
+export default function HistoryScreen() {
+  const [sections, setSections] = useState<Section[]>([]);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  // ────── Safe Date Parser (prevents Jan 1970) ──────
+  const parseDate = (s?: string): Date => {
+    if (!s) return new Date();
+    const parts = s.split(' at ');
+    if (parts.length !== 2) return new Date();
+    const [datePart, timePart] = parts;
+    const nums = datePart.split('/').map(Number);
+    if (nums.length !== 3 || nums.some(isNaN)) return new Date();
+    const [d, m, y] = nums;
+    const timeMatch = timePart.match(/(\d+):(\d+)\s*(AM|PM)/i);
+    if (!timeMatch) return new Date();
+    let [_, h, min, ampm] = timeMatch;
+    let hour = parseInt(h);
+    const minute = parseInt(min);
+    if (isNaN(hour) || isNaN(minute)) return new Date();
+    if (ampm.toUpperCase() === 'PM' && hour !== 12) hour += 12;
+    if (ampm.toUpperCase() === 'AM' && hour === 12) hour = 0;
+    return new Date(y, m - 1, d, hour, minute);
   };
 
+  // ────── Load + Migrate + Dedupe + Group Orders ──────
   useEffect(() => {
     (async () => {
-      const raw = await AsyncStorage.getItem('orders');
-      if (!raw) return;
-      let orders: Order[] = JSON.parse(raw);
-      orders.sort((a, b) => parseDate(b.dateTime).getTime() - parseDate(a.dateTime).getTime());
+      try {
+        const raw = await AsyncStorage.getItem('orders');
+        if (!raw) return;
 
-      const groups: Record<string, Order[]> = {};
-      orders.forEach(o => {
-        const dt = parseDate(o.dateTime);
-        const key = `${dt.toLocaleString('default', { month: 'long' })} ${dt.getFullYear()}`;
-        if (!groups[key]) groups[key] = [];
-        groups[key].push(o);
-      });
+        let orders: any[] = JSON.parse(raw);
 
-      setSections(Object.entries(groups).map(([title, data]) => ({ title, data })));
+        // ---- 1. Keep only valid entries
+        const valid: Order[] = orders
+          .filter((o): o is Order => o && o.id && o.dateTime && o.pdfUri)
+          .map(o => ({
+            id: o.id,
+            clientName: o.clientName ?? '',
+            mobile: o.mobile ?? '',
+            address: o.address ?? '',
+            dateTime: o.dateTime,
+            orderBlocks: Array.isArray(o.orderBlocks) ? o.orderBlocks : [],
+            quotationAmount: o.quotationAmount ?? '0',
+            pdfUri: o.pdfUri,
+          }));
+
+        // ---- 2. DEDUPLICATE (critical for key error)
+        const seen = new Set<string>();
+        const deduped: Order[] = [];
+        for (const o of valid) {
+          if (!seen.has(o.id)) {
+            seen.add(o.id);
+            deduped.push(o);
+          }
+        }
+
+        // ---- 3. Persist cleaned data (once)
+        if (deduped.length !== valid.length) {
+          await AsyncStorage.setItem('orders', JSON.stringify(deduped));
+        }
+
+        // ---- 4. Sort newest first
+        deduped.sort((a, b) => parseDate(b.dateTime).getTime() - parseDate(a.dateTime).getTime());
+
+        // ---- 5. Group by month-year
+        const groups: Record<string, Order[]> = {};
+        deduped.forEach(o => {
+          const dt = parseDate(o.dateTime);
+          const key = `${dt.toLocaleString('default', { month: 'long' })} ${dt.getFullYear()}`;
+          if (!groups[key]) groups[key] = [];
+          groups[key].push(o);
+        });
+
+        const sectionList: Section[] = Object.entries(groups).map(([title, data]) => ({
+          title,
+          data,
+          count: data.length,
+        }));
+
+        setSections(sectionList);
+      } catch (e) {
+        console.error('History load failed:', e);
+      }
     })();
   }, []);
 
-  const resend = async (order: Order) => {
-    const phone = `91${order.mobile}`;
-    const text = `Your order confirmation – Order #${order.id}`;
-    const waUrl = `whatsapp://send?phone=${phone}&text=${encodeURIComponent(text)}`;
+  // ────── Toggle Expand ──────
+  const toggleExpand = (id: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
-    const can = await Linking.canOpenURL(waUrl);
-    if (can) {
-      await Linking.openURL(waUrl);
-      setTimeout(() => Sharing.shareAsync(order.pdfUri), 800);
-    } else {
-      await Sharing.shareAsync(order.pdfUri, { mimeType: 'application/pdf' });
+  // ────── Share ONLY the PDF (no WhatsApp message) ──────
+  const sharePDF = async (pdfUri: string) => {
+    try {
+      await Sharing.shareAsync(pdfUri, { mimeType: 'application/pdf' });
+    } catch (err) {
+      console.error('Share failed:', err);
     }
   };
 
@@ -69,44 +134,117 @@ export default function HistoryScreen() {
     <View style={styles.container}>
       <SectionList
         sections={sections}
-        keyExtractor={i => i.id}
-        renderSectionHeader={({ section: { title } }) => (
-          <Text variant="headlineSmall" style={styles.sectionHeader}>
-            {title}
-          </Text>
-        )}
-        renderItem={({ item }) => (
-          <View style={styles.item}>
-            <Text variant="titleMedium">
-              {item.id} – {item.clientName} ({item.dateTime})
+        // Unique key: id + index to guarantee uniqueness even after dedupe
+        keyExtractor={(item, index) => `${item.id}-${index}`}
+        renderSectionHeader={({ section }) => (
+          <View style={styles.sectionHeader}>
+            <Text variant="titleMedium" style={styles.sectionTitle}>
+              {section.title} ({section.count} quotation{section.count > 1 ? 's' : ''})
             </Text>
-            <Text>Meal: {item.mealType.charAt(0).toUpperCase() + item.mealType.slice(1)}</Text>
-            <Text>Guests: {item.noOfGuests}</Text>
-            <Text>Total: ₹{item.totalCost}</Text>
-            <Text>Mobile: {item.mobile}</Text>
-            <Text>Location: {item.address}</Text>
-            {item.notes && <Text>Notes: {item.notes}</Text>}
-            <Text style={{ marginTop: 4 }}>Menu:</Text>
-            {item.menuItems.map((m, i) => (
-              <Text key={i}>• {m.name} (Qty: {m.qty || '–'}, Cost: {m.cost ? `₹${m.cost}` : '–'})</Text>
-            ))}
-            <Button mode="outlined" onPress={() => resend(item)} style={styles.btn}>
-              Resend via WhatsApp
-            </Button>
-            <Divider style={styles.divider} />
           </View>
         )}
-        ListEmptyComponent={<Text style={styles.empty}>No orders yet.</Text>}
+        renderItem={({ item, index }) => {
+          const isExpanded = expanded.has(item.id);
+          return (
+            <View style={styles.card}>
+              {/* ── Compact Header ── */}
+              <TouchableOpacity onPress={() => toggleExpand(item.id)} activeOpacity={0.7}>
+                <View style={styles.headerRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text variant="titleMedium" style={styles.idText}>
+                      {item.id}
+                    </Text>
+                    <Text style={styles.clientText}>{item.clientName}</Text>
+                    <Text style={styles.dateText}>{item.dateTime}</Text>
+                    <Text style={styles.amountText}>
+                      ₹{parseFloat(item.quotationAmount).toLocaleString('en-IN')}
+                    </Text>
+                  </View>
+                  <IconButton
+                    icon={isExpanded ? 'chevron-up' : 'chevron-down'}
+                    size={20}
+                    style={{ margin: 0 }}
+                  />
+                </View>
+              </TouchableOpacity>
+
+              {/* ── Expandable Details ── */}
+              {isExpanded && (
+                <Animated.View style={styles.details}>
+                  <Divider style={styles.divider} />
+                  <Text style={styles.label}>Mobile: {item.mobile}</Text>
+                  <Text style={styles.label}>Location: {item.address}</Text>
+
+                  <Text style={[styles.label, { marginTop: 8, fontWeight: '600' }]}>
+                    Menu:
+                  </Text>
+                  {item.orderBlocks.map((b, i) => (
+                    <View key={i} style={styles.menuItem}>
+                      <Text style={styles.menuTitle}>• Order {i + 1}:</Text>
+                      <Text style={styles.menuDesc}>{b.description || '–'}</Text>
+                      {b.notes ? (
+                        <Text style={styles.menuNote}>Note: {b.notes}</Text>
+                      ) : null}
+                    </View>
+                  ))}
+
+                  <Button
+                    mode="contained"
+                    icon="file-pdf-box"
+                    onPress={() => sharePDF(item.pdfUri)}
+                    style={styles.shareBtn}
+                    contentStyle={{ height: 44 }}
+                  >
+                    Share PDF
+                  </Button>
+                </Animated.View>
+              )}
+            </View>
+          );
+        }}
+        ListEmptyComponent={
+          <Text style={styles.empty}>No quotations yet. Create one in the New Order tab!</Text>
+        }
       />
     </View>
   );
 }
 
+// ────────────────────── Styles ──────────────────────
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 16, backgroundColor: '#fff' },
-  sectionHeader: { backgroundColor: '#f0f0f0', padding: 8, marginBottom: 8 },
-  item: { marginBottom: 16 },
-  btn: { marginTop: 8 },
-  divider: { marginTop: 8 },
-  empty: { textAlign: 'center', marginTop: 20, fontSize: 16 },
+  container: { flex: 1, backgroundColor: '#f8f9fa' },
+  sectionHeader: {
+    backgroundColor: '#e9ecef',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderColor: '#dee2e6',
+  },
+  sectionTitle: { fontWeight: '600', color: '#212529' },
+  card: {
+    marginHorizontal: 16,
+    marginVertical: 6,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    elevation: 2,
+    overflow: 'hidden',
+  },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 12,
+  },
+  idText: { fontWeight: 'bold', color: '#ff6600' },
+  clientText: { fontSize: 15, color: '#212529' },
+  dateText: { fontSize: 13, color: '#6c757d', marginTop: 2 },
+  amountText: { fontSize: 14, fontWeight: '600', color: '#212529', marginTop: 4 },
+  details: { paddingHorizontal: 12, paddingBottom: 12 },
+  divider: { marginVertical: 8 },
+  label: { fontSize: 14, color: '#495057', marginBottom: 4 },
+  menuItem: { marginLeft: 8, marginBottom: 8 },
+  menuTitle: { fontWeight: '600', color: '#212529' },
+  menuDesc: { marginLeft: 8, color: '#212529' },
+  menuNote: { marginLeft: 8, fontStyle: 'italic', color: '#6c757d', fontSize: 13 },
+  shareBtn: { marginTop: 12, backgroundColor: '#007BFF' }, // blue for PDF
+  empty: { textAlign: 'center', marginTop: 40, fontSize: 16, color: '#6c757d' },
 });
